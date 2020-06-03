@@ -1,0 +1,197 @@
+library(data.table)
+library(dplyr)
+library(magrittr)
+library(tidyr)
+library(ggplot2)
+library(precrec)
+library(randomForest)
+
+##############################################################################
+## MAFS6010S FINAL PROJECT
+## YANG, Xiangjun (20668327)
+## Music Recommendation System
+
+# read data
+train <- read.csv("~/Desktop/6010 ML/hw/Project/Data/train.csv")
+members <- read.csv("~/Desktop/6010 ML/hw/Project/Data/members.csv")
+songs <- read.csv("~/Desktop/6010 ML/hw/Project/Data/songs.csv")
+
+##############################################################################
+## VISUAL INTREPRETATION
+theme_set(theme_gray())
+
+# function to display count of each variable and show relation with target
+target_rel <- function(df, var) {
+  temp <- df %>% 
+    group_by_(var) %>%
+    summarize(count=n(), mean_target=mean(target)) %>%
+    arrange(desc(mean_target))
+  p <- temp %>%
+    ggplot(aes_string(var, "mean_target")) + geom_col(aes(fill=count)) + 
+    scale_fill_gradient2() + coord_flip() +
+    labs(x="Frequency", y="Target")
+  print(p)
+  return(temp)
+}
+target_rel(train, var="source_system_tab")
+target_rel(train, var="source_screen_name")
+target_rel(train, var="source_type")
+
+# function to display the relation between occurence of id and ave target
+target_rel2 <- function(df, var) {
+  temp <- df %>%
+    group_by_(var) %>%
+    summarize(count=n(), mean_target=mean(target)) %>%
+    group_by(count) %>%
+    summarize(new_count=n(), ave_target=mean(mean_target)) %>%
+    rename(items_count=new_count, occurence=count) %>%
+    arrange(desc(ave_target))
+  p <- temp %>%
+    ggplot(aes(occurence, ave_target)) + geom_line(color="mediumpurple") +
+    geom_smooth(color="mediumpurple") + labs(x="Occurence", y="Ave Target")
+  print(p)
+  return(temp)
+}
+target_rel2(train, "song_id")
+target_rel2(train, "msno")
+
+# function to display the distribution of member charateristics
+members_dist <- function(df, var, x, xmin, xmax, ymin, ymax) {
+  temp <- df %>%
+    group_by_(var) %>% summarize(count=n()) %>% arrange(desc(count))
+  p <- temp %>%
+    ggplot(aes_string(var, "count")) + geom_col(fill="goldenrod2", size=1) + 
+    labs(x=x, y="Frequency") + ylim(ymin, ymax) + xlim(xmin, xmax)
+  print(p)
+  return(temp)
+}
+members_dist(members, "bd", "Age", 1, 100, 0, 800)
+members_dist(members, "city", "City", 0, 25, 0, 20000)
+members_dist(members, "registered_via", "Registration Method", 0, 16, 0, 12000)
+
+##############################################################################
+## DATA PROCESSING
+top <- function(df, var) {
+  temp <- df %>% group_by_(var) %>% count %>% arrange(desc(n))
+  print(temp)
+}
+top(train, "target")
+artist_count <- top(songs, "artist_name")
+lyricist_count <- top(songs, "lyricist")
+composer_count <- top(songs, "composer")
+language_count <- top(songs, "language")
+
+genre_count <- songs %>%
+  separate(genre_ids, c("one", "two", "three", "four", "five", "six",
+                        "seven", "eight"), extra="merge") %>%
+  select(one:eight) %>%
+  gather(one:eight, key="nth_id", value="genre_ids", na.rm=TRUE) %>%
+  group_by(genre_ids) %>%
+  count %>%
+  arrange(desc(n)) %>%
+  print
+
+songs %<>% 
+  left_join(artist_count, by="artist_name")  %>%
+  left_join(lyricist_count, by="lyricist") %>%
+  left_join(composer_count, by="composer") %>%
+  left_join(language_count, by="language") %>%
+  rename(art_cnt=n.x, lyr_cnt=n.y, cmp_cnt=n.x.x, lng_cnt=n.y.y)
+
+
+# reduce the number of categories based on interest
+# 0 - high interest - local and search
+# 1 - random on internet
+# 3 - random
+# 4 - social
+count_frame <- function(df, var, new_name) {
+  return(df %>%
+           group_by_(var) %>%
+           count %>%
+           rename_(.dots=setNames('n', new_name)))
+}
+train_song_cnt <- count_frame(train, 'song_id', 'song_cnt')
+train_sst <- count_frame(train, 'source_system_tab', 'sst_cnt')
+train_ssn <- count_frame(train, 'source_screen_name', 'ssn_cnt')
+train_st <- count_frame(train, 'source_type', 'st_cnt')
+
+train %<>% 
+  mutate(sst=ifelse((source_system_tab %in% c('my library', 'search')), 0, 
+                    ifelse((source_system_tab %in% 
+                            c('discover', 'explore', 'radio')), 1,
+                             ifelse((source_system_tab %in% 
+                                     c('null', 
+                                       '', 
+                                       'notification', 
+                                       'settings')), 2, 3)))) %>%
+  mutate(ssn=ifelse((source_screen_name %in% c('Payment', 
+                                               'My library', 
+                                               'My library_Search',
+                                               'Local playlist more',
+                                               'Search')), 0,
+                     ifelse((source_screen_name %in% c('Album more', 
+                                                       'Artist more',
+                                                       'Concert', 
+                                                       'Discover Chart',
+                                                       'Discover Feature', 
+                                                       'Discover Genre',
+                                                       'Discover New', 
+                                                       'Explore', 
+                                                       'Radio')), 1,
+                             ifelse((source_screen_name %in% c('People global', 
+                                                               'People local', 
+                                                               'Search Home',
+                                                               'Search Trends', 
+                                                               'Self Profile more')), 2, 3)))) %>% 
+  mutate(st=ifelse((source_type %in% c('local-library', 'local-playlist')), 0,
+                    ifelse((source_type %in% c('artist', 
+                                               'album', 
+                                               'my-daily-playlist',
+                                               'online-playlist', 
+                                               'radio', 
+                                               'song-based-playlist',
+                                               'top-hits-for-artist', 
+                                               'topic-article-playlist', 
+                                               'song')), 1, 2)))
+
+train %<>% 
+  left_join(train_song_cnt, by="song_id") %>%
+  left_join(songs[,c(1,8:11)], by="song_id")
+
+target_rel(train, "sst")
+target_rel(train, "ssn")
+target_rel(train, "st")
+
+col <- c("target", "sst", "ssn", "st")
+train[,col] <- lapply(train[,col], as.factor)
+
+##############################################################################
+## MODEL FITTING
+# logistic regression
+set.seed(500)
+ind <- sample(2, nrow(train), replace=TRUE, prob=c(0.6,0.4))
+train_df <- train[ind==1, c(6:14)]
+test_df <- train[ind==2, c(6:14)]
+lg.fit <- glm(target~., train_df, family="binomial")
+summary(lg.fit)
+# confusion matrix
+lg.probs <- predict(lg.fit, test_df, type="response")
+lg.pred <- ifelse(lg.probs > 0.5, 1, 0)
+lg.tab <- table(predict=lg.pred, actual=test_df$target)
+# miss classification error 
+(1-sum(diag(lg.tab))/sum(lg.tab))
+# ROC curve
+lg.obj <- evalmod(scores =lg.probs, labels=test_df$target)
+autoplot(lg.obj)
+auc(lg.obj)
+
+# random forest
+rf <- randomForest(target~., train_df, ntree=20, na.action=na.omit)
+# confusion matrix
+rf.probs <- predict(rf, test_df)
+rf.tab <- table(predict=rf.probs, actual=test_df$target)
+# miss classification error 
+(1-sum(diag(rf.tab))/sum(rf.tab))
+# variable importance
+varImpPlot(rf)
+
